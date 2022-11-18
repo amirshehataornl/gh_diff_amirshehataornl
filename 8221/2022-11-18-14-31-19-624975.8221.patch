@@ -1,0 +1,106 @@
+diff --git a/prov/shm/src/smr.h b/prov/shm/src/smr.h
+index 8d8868348..80d87cc5b 100644
+--- a/prov/shm/src/smr.h
++++ b/prov/shm/src/smr.h
+@@ -307,6 +307,8 @@ struct smr_ep {
+ 
+ 	struct dlist_entry	sar_list;
+ 
++	ofi_spin_t		order_lock;
++
+ 	int			ep_idx;
+ 	struct smr_sock_info	*sock_info;
+ 	void			*dsa_context;
+diff --git a/prov/shm/src/smr_ep.c b/prov/shm/src/smr_ep.c
+index 91e03d565..5fe6862e5 100644
+--- a/prov/shm/src/smr_ep.c
++++ b/prov/shm/src/smr_ep.c
+@@ -1776,6 +1776,7 @@ int smr_endpoint(struct fid_domain *domain, struct fi_info *info,
+ 	ep->util_ep.ep_fid.msg = &smr_msg_ops;
+ 	ep->util_ep.ep_fid.tagged = &smr_tag_ops;
+ 
++	ofi_spin_init(&ep->order_lock);
+ 	ep->cmd_ctx_fs = smr_cmd_ctx_fs_create(info->rx_attr->size, NULL, NULL);
+ 	ep->pend_fs = smr_pend_fs_create(info->tx_attr->size, NULL, NULL);
+ 	ep->sar_fs = smr_sar_fs_create(info->rx_attr->size, NULL, NULL);
+diff --git a/prov/shm/src/smr_progress.c b/prov/shm/src/smr_progress.c
+index 6a26b02d0..01264ea54 100644
+--- a/prov/shm/src/smr_progress.c
++++ b/prov/shm/src/smr_progress.c
+@@ -807,6 +807,7 @@ static int smr_progress_cmd_msg(struct smr_ep *ep, struct smr_cmd *cmd)
+ 	if (cmd->msg.hdr.op == ofi_op_tagged) {
+ 		ret = peer_srx->owner_ops->get_tag(peer_srx, addr,
+ 				cmd->msg.hdr.tag, &rx_entry);
++		ofi_spin_unlock(&ep->order_lock);
+ 		if (ret == -FI_ENOENT) {
+ 			ret = smr_alloc_cmd_ctx(ep, rx_entry, cmd);
+ 			if (ret)
+@@ -818,6 +819,7 @@ static int smr_progress_cmd_msg(struct smr_ep *ep, struct smr_cmd *cmd)
+ 	} else {
+ 		ret = peer_srx->owner_ops->get_msg(peer_srx, addr,
+ 				cmd->msg.hdr.size, &rx_entry);
++		ofi_spin_unlock(&ep->order_lock);
+ 		if (ret == -FI_ENOENT) {
+ 			ret = smr_alloc_cmd_ctx(ep, rx_entry, cmd);
+ 			if (ret)
+@@ -1017,7 +1019,24 @@ static void smr_progress_cmd(struct smr_ep *ep)
+ 	int ret = 0;
+ 	int64_t pos;
+ 
+-	while ((ce = smr_recv_cmd(ep->region, &pos))) {
++	/* ep->order_lock is used to serialize the message/tag matching.
++	 * We keep the lock until the matching is complete. This will
++	 * ensure that commands are matched in the order they are
++	 * received, if there are multiple progress threads.
++	 *
++	 * This lock should be low cost because it's only used by this
++	 * single process.
++	 *
++	 * Other processes are free to post on the queue without the need
++	 * for locking the queue.
++	 */
++	while (1) {
++		ofi_spin_lock(&ep->order_lock);
++		ce = smr_recv_cmd(ep->region, &pos);
++		if (!ce) {
++			ofi_spin_unlock(&ep->order_lock);
++			break;
++		}
+ 		switch (ce->cmd.msg.hdr.op) {
+ 		case ofi_op_msg:
+ 		case ofi_op_tagged:
+@@ -1025,12 +1044,14 @@ static void smr_progress_cmd(struct smr_ep *ep)
+ 			break;
+ 		case ofi_op_write:
+ 		case ofi_op_read_req:
++			ofi_spin_unlock(&ep->order_lock);
+ 			ret = smr_progress_cmd_rma(ep, &ce->cmd,
+ 				&ce->rma_cmd);
+ 			ofi_atomic_inc64(&ep->region->cmd_cnt);
+ 			break;
+ 		case ofi_op_write_async:
+ 		case ofi_op_read_async:
++			ofi_spin_unlock(&ep->order_lock);
+ 			ofi_ep_rx_cntr_inc_func(&ep->util_ep,
+ 						ce->cmd.msg.hdr.op);
+ 			ofi_atomic_inc64(&ep->region->cmd_cnt);
+@@ -1038,15 +1059,18 @@ static void smr_progress_cmd(struct smr_ep *ep)
+ 		case ofi_op_atomic:
+ 		case ofi_op_atomic_fetch:
+ 		case ofi_op_atomic_compare:
++			ofi_spin_unlock(&ep->order_lock);
+ 			ret = smr_progress_cmd_atomic(ep, &ce->cmd,
+ 				&ce->rma_cmd);
+ 			ofi_atomic_inc64(&ep->region->cmd_cnt);
+ 			break;
+ 		case SMR_OP_MAX + ofi_ctrl_connreq:
++			ofi_spin_unlock(&ep->order_lock);
+ 			smr_progress_connreq(ep, &ce->cmd);
+ 			ofi_atomic_inc64(&ep->region->cmd_cnt);
+ 			break;
+ 		default:
++			ofi_spin_unlock(&ep->order_lock);
+ 			FI_WARN(&smr_prov, FI_LOG_EP_CTRL,
+ 				"unidentified operation type\n");
+ 			ret = -FI_EINVAL;
+
