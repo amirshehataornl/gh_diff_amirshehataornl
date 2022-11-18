@@ -1,0 +1,1701 @@
+diff --git a/Makefile.am b/Makefile.am
+index 2e751409d..d28e7d0bc 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -85,6 +85,7 @@ common_srcs =				\
+ 	prov/util/src/rocr_mem_monitor.c \
+ 	prov/util/src/ze_mem_monitor.c \
+ 	prov/util/src/cuda_ipc_monitor.c \
++	prov/util/src/rocr_ipc_monitor.c \
+ 	prov/util/src/util_coll.c
+ 
+ 
+diff --git a/include/ofi_hmem.h b/include/ofi_hmem.h
+index 6f2e27480..d8fab9afa 100644
+--- a/include/ofi_hmem.h
++++ b/include/ofi_hmem.h
+@@ -44,6 +44,7 @@
+ extern bool ofi_hmem_disable_p2p;
+ 
+ #define MAX_IPC_HANDLE_SIZE	64
++#define MAX_NUM_ASYNC_OP	4
+ 
+ /*
+  * This structure is part of the
+@@ -88,15 +89,10 @@ cudaError_t ofi_cudaFree(void *ptr);
+ 
+ /* Libfabric support ROCr operations. */
+ 
+-hsa_status_t ofi_hsa_memory_copy(void *dst, const void *src, size_t size);
+ hsa_status_t ofi_hsa_amd_pointer_info(void *ptr, hsa_amd_pointer_info_t *info,
+ 				      void *(*alloc)(size_t),
+ 				      uint32_t *num_agents_accessible,
+ 				      hsa_agent_t **accessible);
+-hsa_status_t ofi_hsa_init(void);
+-hsa_status_t ofi_hsa_shut_down(void);
+-hsa_status_t ofi_hsa_status_string(hsa_status_t status,
+-				   const char **status_string);
+ const char *ofi_hsa_status_to_string(hsa_status_t status);
+ 
+ hsa_status_t ofi_hsa_amd_dereg_dealloc_cb(void *ptr,
+@@ -105,31 +101,33 @@ hsa_status_t ofi_hsa_amd_reg_dealloc_cb(void *ptr,
+ 					hsa_amd_deallocation_callback_t cb,
+ 					void *user_data);
+ 
+-hsa_status_t ofi_hsa_amd_memory_lock(void *host_ptr, size_t size,
+-				     hsa_agent_t *agents, int num_agents,
+-				     void **agent_ptr);
+-hsa_status_t ofi_hsa_amd_memory_unlock(void *host_ptr);
+-
+ #endif /* HAVE_ROCR */
+ 
+ struct ofi_hmem_ops {
+ 	bool initialized;
+ 	int (*init)(void);
+ 	int (*cleanup)(void);
++	int (*async_copy_to_hmem)(uint64_t device, void *dest, const void *src,
++			    size_t size, void **stream);
++	int (*async_copy_from_hmem)(uint64_t device, void *dest, const void *src,
++			      size_t size, void **stream);
++	int (*async_copy_query)(void *stream);
+ 	int (*copy_to_hmem)(uint64_t device, void *dest, const void *src,
+ 			size_t size);
+ 	int (*copy_from_hmem)(uint64_t device, void *dest, const void *src,
+ 			size_t size);
+ 	bool (*is_addr_valid)(const void *addr, uint64_t *device, uint64_t *flags);
+-	int (*get_handle)(void *base_addr, void **handle);
+-	int (*open_handle)(void **handle, uint64_t device, void **mapped_addr);
++	int (*get_handle)(void *base_addr, size_t base_length, void **handle);
++	int (*open_handle)(void **handle, size_t base_length, uint64_t device,
++			   void **mapped_addr);
+ 	int (*close_handle)(void *mapped_addr);
+ 	int (*host_register)(void *addr, size_t size);
+ 	int (*host_unregister)(void *addr);
+ 	int (*get_base_addr)(const void *addr, void **base_addr,
+-			size_t *base_length);
++			     size_t *base_length);
+ 	bool (*is_ipc_enabled)(void);
+ 	int (*get_ipc_handle_size)(size_t *size);
++	int (*get_async_copy_cutoff)(size_t *size);
+ };
+ 
+ extern struct ofi_hmem_ops hmem_ops[];
+@@ -143,7 +141,18 @@ int rocr_hmem_cleanup(void);
+ bool rocr_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags);
+ int rocr_host_register(void *ptr, size_t size);
+ int rocr_host_unregister(void *ptr);
++int rocr_get_ipc_handle_size(size_t *size);
+ int rocr_get_base_addr(const void *ptr, void **base, size_t *size);
++int rocr_get_handle(void *dev_buf, size_t size, void **handle);
++int rocr_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr);
++int rocr_close_handle(void *ipc_ptr);
++bool rocr_is_ipc_enabled(void);
++int rocr_async_copy_to_dev(uint64_t device, void *dst, const void *src,
++			  size_t size, void **stream);
++int rocr_async_copy_from_dev(uint64_t device, void *dst, const void *src,
++			    size_t size, void **stream);
++int rocr_async_copy_query(void *stream);
++int rocr_get_async_copy_cutoff(size_t *size);
+ 
+ int cuda_copy_to_dev(uint64_t device, void *dev, const void *host, size_t size);
+ int cuda_copy_from_dev(uint64_t device, void *host, const void *dev, size_t size);
+@@ -154,8 +163,8 @@ int cuda_host_register(void *ptr, size_t size);
+ int cuda_host_unregister(void *ptr);
+ int cuda_dev_register(struct fi_mr_attr *mr_attr, uint64_t *handle);
+ int cuda_dev_unregister(uint64_t handle);
+-int cuda_get_handle(void *dev_buf, void **handle);
+-int cuda_open_handle(void **handle, uint64_t device, void **ipc_ptr);
++int cuda_get_handle(void *dev_buf, size_t size, void **handle);
++int cuda_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr);
+ int cuda_close_handle(void *ipc_ptr);
+ int cuda_get_base_addr(const void *ptr, void **base, size_t *size);
+ bool cuda_is_ipc_enabled(void);
+@@ -177,8 +186,8 @@ int ze_hmem_copy(uint64_t device, void *dst, const void *src, size_t size);
+ int ze_hmem_init(void);
+ int ze_hmem_cleanup(void);
+ bool ze_hmem_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags);
+-int ze_hmem_get_handle(void *dev_buf, void **handle);
+-int ze_hmem_open_handle(void **handle, uint64_t device, void **ipc_ptr);
++int ze_hmem_get_handle(void *dev_buf, size_t size, void **handle);
++int ze_hmem_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr);
+ int ze_hmem_get_shared_handle(int dev_fd, void *dev_buf, int *ze_fd,
+ 			      void **handle);
+ int ze_hmem_open_shared_handle(int dev_fd, void **handle, int *ze_fd,
+@@ -208,8 +217,8 @@ int synapseai_copy_from_hmem(uint64_t device, void *dest, const void *src,
+ int synapseai_get_dmabuf_fd(uint64_t addr, uint64_t size, int* fd);
+ bool synapseai_is_addr_valid(const void *addr, uint64_t *device,
+                              uint64_t *flags);
+-int synapseai_get_handle(void *dev_buf, void **handle);
+-int synapseai_open_handle(void **handle, uint64_t device, void **ipc_ptr);
++int synapseai_get_handle(void *dev_buf, size_t size, void **handle);
++int synapseai_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr);
+ int synapseai_close_handle(void *ipc_ptr);
+ int synapseai_host_register(void *ptr, size_t size);
+ int synapseai_host_unregister(void *ptr);
+@@ -223,6 +232,12 @@ static inline int ofi_memcpy(uint64_t device, void *dest, const void *src,
+ 	return FI_SUCCESS;
+ }
+ 
++static inline int ofi_no_async_memcpy(uint64_t device, void *dest, const void *src,
++			     size_t size, void **stream)
++{
++	return -FI_ENOSYS;
++}
++
+ static inline int ofi_hmem_init_noop(void)
+ {
+ 	return FI_SUCCESS;
+@@ -233,13 +248,18 @@ static inline int ofi_hmem_cleanup_noop(void)
+ 	return FI_SUCCESS;
+ }
+ 
+-static inline int ofi_hmem_no_get_handle(void *base_addr, void **handle)
++static inline int ofi_no_async_copy_query(void *stream)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+-static inline int
+-ofi_hmem_no_open_handle(void **handle, uint64_t device, void **mapped_addr)
++static inline int ofi_hmem_no_get_handle(void *base_addr, size_t size, void **handle)
++{
++	return -FI_ENOSYS;
++}
++
++static inline int ofi_hmem_no_open_handle(void **handle, size_t size, uint64_t device,
++					  void **mapped_addr)
+ {
+ 	return -FI_ENOSYS;
+ }
+@@ -254,6 +274,11 @@ static inline int ofi_hmem_no_get_ipc_handle_size(size_t *size)
+ 	return -FI_ENOSYS;
+ }
+ 
++static inline int ofi_hmem_no_get_async_copy_cutoff(size_t *size)
++{
++	return -FI_ENOSYS;
++}
++
+ static inline int ofi_hmem_host_register_noop(void *addr, size_t size)
+ {
+ 	return FI_SUCCESS;
+@@ -280,6 +305,20 @@ static inline bool ofi_hmem_p2p_disabled(void)
+ 	return ofi_hmem_disable_p2p;
+ }
+ 
++int ofi_get_async_copy_cutoff(enum fi_hmem_iface iface, size_t *size);
++ssize_t ofi_async_copy_from_hmem_iov(void *dest, size_t size,
++				enum fi_hmem_iface hmem_iface, uint64_t device,
++				const struct iovec *hmem_iov,
++				size_t hmem_iov_count, uint64_t hmem_iov_offset,
++				void **stream);
++
++ssize_t ofi_async_copy_to_hmem_iov(enum fi_hmem_iface hmem_iface, uint64_t device,
++				const struct iovec *hmem_iov,
++				size_t hmem_iov_count, uint64_t hmem_iov_offset,
++				const void *src, size_t size, void **stream);
++
++int ofi_async_copy_query(enum fi_hmem_iface iface, void *stream);
++
+ ssize_t ofi_copy_from_hmem_iov(void *dest, size_t size,
+ 			       enum fi_hmem_iface hmem_iface, uint64_t device,
+ 			       const struct iovec *hmem_iov,
+@@ -290,9 +329,10 @@ ssize_t ofi_copy_to_hmem_iov(enum fi_hmem_iface hmem_iface, uint64_t device,
+ 			     size_t hmem_iov_count, uint64_t hmem_iov_offset,
+ 			     const void *src, size_t size);
+ 
+-int ofi_hmem_get_handle(enum fi_hmem_iface iface, void *base_addr, void **handle);
++int ofi_hmem_get_handle(enum fi_hmem_iface iface, void *base_addr,
++			size_t size, void **handle);
+ int ofi_hmem_open_handle(enum fi_hmem_iface iface, void **handle,
+-			 uint64_t device, void **mapped_addr);
++			 size_t size, uint64_t device, void **mapped_addr);
+ int ofi_hmem_close_handle(enum fi_hmem_iface iface, void *mapped_addr);
+ int ofi_hmem_get_base_addr(enum fi_hmem_iface iface, const void *addr,
+ 			   void **base_addr, size_t *base_length);
+diff --git a/include/ofi_mem.h b/include/ofi_mem.h
+index a3e8155df..673c815e9 100644
+--- a/include/ofi_mem.h
++++ b/include/ofi_mem.h
+@@ -152,6 +152,9 @@ struct name {							\
+ typedef void (*name ## _entry_init_func)(entrytype *buf,	\
+ 					 void *arg);		\
+ 								\
++typedef void (*name ## _entry_destroy_func)(entrytype *buf,	\
++					 void *arg);		\
++								\
+ static inline void						\
+ name ## _init(struct name *fs, size_t size,			\
+ 	      name ## _entry_init_func init, void *arg)		\
+@@ -194,9 +197,19 @@ static inline void name ## _free(struct name *fs)		\
+ {								\
+ 	free(fs);						\
+ }								\
++static inline void name ## _destroy(struct name *fs,		\
++	size_t size, name ## _entry_destroy_func destroy,	\
++	void *arg)						\
++{								\
++	ssize_t i;						\
++	for (i = size - 1; i >= 0; i--) {			\
++		if (destroy)					\
++			destroy(&fs->entry[i].buf, arg);	\
++	}							\
++	free(fs);						\
++}								\
+ void dummy ## name (void) /* work-around global ; scope */
+ 
+-
+ /*
+  * Buffer pool (free stack) template for shared memory regions
+  */
+diff --git a/include/ofi_mr.h b/include/ofi_mr.h
+index b5cf88ccb..a5452a854 100644
+--- a/include/ofi_mr.h
++++ b/include/ofi_mr.h
+@@ -229,6 +229,7 @@ extern struct ofi_mem_monitor *memhooks_monitor;
+ extern struct ofi_mem_monitor *cuda_monitor;
+ extern struct ofi_mem_monitor *cuda_ipc_monitor;
+ extern struct ofi_mem_monitor *rocr_monitor;
++extern struct ofi_mem_monitor *rocr_ipc_monitor;
+ extern struct ofi_mem_monitor *ze_monitor;
+ extern struct ofi_mem_monitor *import_monitor;
+ 
+diff --git a/prov/hook/dmabuf_peer_mem/src/hook_dmabuf_peer_mem.c b/prov/hook/dmabuf_peer_mem/src/hook_dmabuf_peer_mem.c
+index 33503fe33..15dd21b4a 100644
+--- a/prov/hook/dmabuf_peer_mem/src/hook_dmabuf_peer_mem.c
++++ b/prov/hook/dmabuf_peer_mem/src/hook_dmabuf_peer_mem.c
+@@ -144,7 +144,7 @@ static void get_mr_fd(struct dmabuf_peer_mem_mr *mr,
+ 		 * The region is not covered by any entry in the registry, add a
+ 		 * new entry to the registry now.
+ 		 */
+-		err = ze_hmem_get_handle(iov->iov_base, &handle);
++		err = ze_hmem_get_handle(iov->iov_base, iov->iov_len, &handle);
+ 		if (err)
+ 			goto out_unlock;
+ 
+diff --git a/prov/shm/src/smr_ep.c b/prov/shm/src/smr_ep.c
+index 66a8dfffd..f6ff7cf00 100644
+--- a/prov/shm/src/smr_ep.c
++++ b/prov/shm/src/smr_ep.c
+@@ -404,6 +404,7 @@ static int smr_format_ipc(struct smr_cmd *cmd, void *ptr, size_t len,
+ 		return ret;
+ 
+ 	ret = ofi_hmem_get_handle(cmd->msg.data.ipc_info.iface, base,
++				   cmd->msg.data.ipc_info.base_length,
+ 				   (void **)&cmd->msg.data.ipc_info.ipc_handle);
+ 	if (ret)
+ 		return ret;
+diff --git a/prov/util/src/rocr_ipc_monitor.c b/prov/util/src/rocr_ipc_monitor.c
+new file mode 100644
+index 000000000..3e489ef2a
+--- /dev/null
++++ b/prov/util/src/rocr_ipc_monitor.c
+@@ -0,0 +1,69 @@
++/*
++ * (C) Copyright (c) 2022 UT-Battelle, LLC. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "ofi_mr.h"
++
++#if HAVE_ROCR
++
++#include "ofi_hmem.h"
++
++static bool rocr_ipc_monitor_valid(struct ofi_mem_monitor *monitor,
++			const struct ofi_mr_info *info,
++			struct ofi_mr_entry *entry)
++{
++	return (memcmp((void **)&info->ipc_handle,
++		(void **)&entry->info.ipc_handle,
++		sizeof(hsa_amd_ipc_memory_t)) == 0);
++}
++
++#else
++
++static bool rocr_ipc_monitor_valid(struct ofi_mem_monitor *monitor,
++			const struct ofi_mr_info *info,
++			struct ofi_mr_entry *entry)
++{
++	return false;
++}
++
++#endif /* HAVE_ROCR */
++
++static struct ofi_mem_monitor rocr_ipc_monitor_ = {
++	.init = ofi_monitor_init,
++	.cleanup = ofi_monitor_cleanup,
++	.start = ofi_monitor_start_no_op,
++	.stop = ofi_monitor_stop_no_op,
++	.subscribe = ofi_monitor_subscribe_no_op,
++	.unsubscribe = ofi_monitor_unsubscribe_no_op,
++	.valid = rocr_ipc_monitor_valid,
++};
++
++struct ofi_mem_monitor *rocr_ipc_monitor = &rocr_ipc_monitor_;
+diff --git a/prov/util/src/util_mem_monitor.c b/prov/util/src/util_mem_monitor.c
+index ac0c75cd9..c3ecef016 100644
+--- a/prov/util/src/util_mem_monitor.c
++++ b/prov/util/src/util_mem_monitor.c
+@@ -174,6 +174,7 @@ void ofi_monitors_init(void)
+ 	cuda_monitor->init(cuda_monitor);
+ 	cuda_ipc_monitor->init(cuda_ipc_monitor);
+ 	rocr_monitor->init(rocr_monitor);
++	rocr_ipc_monitor->init(rocr_ipc_monitor);
+ 	ze_monitor->init(ze_monitor);
+ 	import_monitor->init(import_monitor);
+ 
+diff --git a/prov/verbs/src/verbs_mr.c b/prov/verbs/src/verbs_mr.c
+index 63da7c4d4..d092e6d93 100644
+--- a/prov/verbs/src/verbs_mr.c
++++ b/prov/verbs/src/verbs_mr.c
+@@ -74,7 +74,7 @@ struct ibv_mr *vrb_mr_ibv_reg_dmabuf_mr(struct ibv_pd *pd, const void *buf,
+ 	if (failover_policy == ALWAYS)
+ 		goto failover;
+ 
+-	err = ze_hmem_get_handle((void *)buf, &handle);
++	err = ze_hmem_get_handle((void *)buf, len, &handle);
+ 	if (err)
+ 		return NULL;
+ 
+diff --git a/src/hmem.c b/src/hmem.c
+index 406ed4c8b..07406c1b7 100644
+--- a/src/hmem.c
++++ b/src/hmem.c
+@@ -49,6 +49,9 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.cleanup = ofi_hmem_cleanup_noop,
+ 		.copy_to_hmem = ofi_memcpy,
+ 		.copy_from_hmem = ofi_memcpy,
++		.async_copy_to_hmem = ofi_no_async_memcpy,
++		.async_copy_from_hmem = ofi_no_async_memcpy,
++		.async_copy_query = ofi_no_async_copy_query,
+ 		.get_handle = ofi_hmem_no_get_handle,
+ 		.open_handle = ofi_hmem_no_open_handle,
+ 		.close_handle = ofi_hmem_no_close_handle,
+@@ -57,6 +60,7 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.get_base_addr = ofi_hmem_no_base_addr,
+ 		.is_ipc_enabled = ofi_hmem_no_is_ipc_enabled,
+ 		.get_ipc_handle_size = ofi_hmem_no_get_ipc_handle_size,
++		.get_async_copy_cutoff = ofi_hmem_no_get_async_copy_cutoff,
+ 	},
+ 	[FI_HMEM_CUDA] = {
+ 		.initialized = false,
+@@ -64,6 +68,9 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.cleanup = cuda_hmem_cleanup,
+ 		.copy_to_hmem = cuda_copy_to_dev,
+ 		.copy_from_hmem = cuda_copy_from_dev,
++		.async_copy_to_hmem = ofi_no_async_memcpy,
++		.async_copy_from_hmem = ofi_no_async_memcpy,
++		.async_copy_query = ofi_no_async_copy_query,
+ 		.is_addr_valid = cuda_is_addr_valid,
+ 		.get_handle = cuda_get_handle,
+ 		.open_handle = cuda_open_handle,
+@@ -73,6 +80,7 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.get_base_addr = cuda_get_base_addr,
+ 		.is_ipc_enabled = cuda_is_ipc_enabled,
+ 		.get_ipc_handle_size = cuda_get_ipc_handle_size,
++		.get_async_copy_cutoff = ofi_hmem_no_get_async_copy_cutoff,
+ 	},
+ 	[FI_HMEM_ROCR] = {
+ 		.initialized = false,
+@@ -80,15 +88,19 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.cleanup = rocr_hmem_cleanup,
+ 		.copy_to_hmem = rocr_copy_to_dev,
+ 		.copy_from_hmem = rocr_copy_from_dev,
++		.async_copy_to_hmem = rocr_async_copy_to_dev,
++		.async_copy_from_hmem = rocr_async_copy_from_dev,
++		.async_copy_query = rocr_async_copy_query,
+ 		.is_addr_valid = rocr_is_addr_valid,
+-		.get_handle = ofi_hmem_no_get_handle,
+-		.open_handle = ofi_hmem_no_open_handle,
+-		.close_handle = ofi_hmem_no_close_handle,
++		.get_handle = rocr_get_handle,
++		.open_handle = rocr_open_handle,
++		.close_handle = rocr_close_handle,
+ 		.host_register = rocr_host_register,
+ 		.host_unregister = rocr_host_unregister,
+ 		.get_base_addr = rocr_get_base_addr,
+-		.is_ipc_enabled = ofi_hmem_no_is_ipc_enabled,
+-		.get_ipc_handle_size = ofi_hmem_no_get_ipc_handle_size,
++		.is_ipc_enabled = rocr_is_ipc_enabled,
++		.get_ipc_handle_size = rocr_get_ipc_handle_size,
++		.get_async_copy_cutoff = rocr_get_async_copy_cutoff,
+ 	},
+ 	[FI_HMEM_ZE] = {
+ 		.initialized = false,
+@@ -96,6 +108,9 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.cleanup = ze_hmem_cleanup,
+ 		.copy_to_hmem = ze_hmem_copy,
+ 		.copy_from_hmem = ze_hmem_copy,
++		.async_copy_to_hmem = ofi_no_async_memcpy,
++		.async_copy_from_hmem = ofi_no_async_memcpy,
++		.async_copy_query = ofi_no_async_copy_query,
+ 		.is_addr_valid = ze_hmem_is_addr_valid,
+ 		.get_handle = ze_hmem_get_handle,
+ 		.open_handle = ze_hmem_open_handle,
+@@ -105,6 +120,7 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.get_base_addr = ze_hmem_get_base_addr,
+ 		.is_ipc_enabled = ze_hmem_p2p_enabled,
+ 		.get_ipc_handle_size = ze_hmem_get_ipc_handle_size,
++		.get_async_copy_cutoff = ofi_hmem_no_get_async_copy_cutoff,
+ 	},
+ 	[FI_HMEM_NEURON] = {
+ 		.initialized = false,
+@@ -113,6 +129,10 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.copy_to_hmem = neuron_copy_to_dev,
+ 		.copy_from_hmem = neuron_copy_from_dev,
+ 		.get_ipc_handle_size = ofi_hmem_no_get_ipc_handle_size,
++		.async_copy_to_hmem = ofi_no_async_memcpy,
++		.async_copy_from_hmem = ofi_no_async_memcpy,
++		.async_copy_query = ofi_no_async_copy_query,
++		.get_async_copy_cutoff = ofi_hmem_no_get_async_copy_cutoff,
+ 	},
+ 	[FI_HMEM_SYNAPSEAI] = {
+ 		.initialized = false,
+@@ -120,6 +140,9 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.cleanup = synapseai_cleanup,
+ 		.copy_to_hmem = synapseai_copy_to_hmem,
+ 		.copy_from_hmem = synapseai_copy_from_hmem,
++		.async_copy_to_hmem = ofi_no_async_memcpy,
++		.async_copy_from_hmem = ofi_no_async_memcpy,
++		.async_copy_query = ofi_no_async_copy_query,
+ 		.get_handle = synapseai_get_handle,
+ 		.open_handle = synapseai_open_handle,
+ 		.close_handle = synapseai_close_handle,
+@@ -128,9 +151,26 @@ struct ofi_hmem_ops hmem_ops[] = {
+ 		.get_base_addr = synapseai_get_base_addr,
+ 		.is_ipc_enabled = synapseai_is_ipc_enabled,
+ 		.get_ipc_handle_size = ofi_hmem_no_get_ipc_handle_size,
++		.get_async_copy_cutoff = ofi_hmem_no_get_async_copy_cutoff,
+ 	},
+ };
+ 
++static inline int ofi_async_copy_to_hmem(enum fi_hmem_iface iface, uint64_t device,
++				   void *dest, const void *src, size_t size,
++				   void **stream)
++{
++	return hmem_ops[iface].async_copy_to_hmem(device, dest, src, size,
++						  stream);
++}
++
++static inline int ofi_async_copy_from_hmem(enum fi_hmem_iface iface, uint64_t device,
++					 void *dest, const void *src, size_t size,
++					 void **stream)
++{
++	return hmem_ops[iface].async_copy_from_hmem(device, dest, src, size,
++						    stream);
++}
++
+ static inline int ofi_copy_to_hmem(enum fi_hmem_iface iface, uint64_t device,
+ 				   void *dest, const void *src, size_t size)
+ {
+@@ -143,6 +183,59 @@ static inline int ofi_copy_from_hmem(enum fi_hmem_iface iface, uint64_t device,
+ 	return hmem_ops[iface].copy_from_hmem(device, dest, src, size);
+ }
+ 
++static ssize_t
++ofi_async_copy_hmem_iov_buf(enum fi_hmem_iface hmem_iface, uint64_t device,
++			    const struct iovec *hmem_iov,
++			    size_t hmem_iov_count,
++			    uint64_t hmem_iov_offset, void *buf,
++			    size_t size, int dir, void **stream)
++{
++	uint64_t done = 0, len;
++	char *hmem_buf;
++	size_t i;
++	int ret;
++
++	if (!stream || hmem_iov_count > MAX_NUM_ASYNC_OP)
++		return -FI_EINVAL;
++
++	*stream = NULL;
++
++	for (i = 0; i < hmem_iov_count && size; i++) {
++		len = hmem_iov[i].iov_len;
++
++		if (hmem_iov_offset > len) {
++			hmem_iov_offset -= len;
++			continue;
++		}
++
++		hmem_buf = (char *)hmem_iov[i].iov_base + hmem_iov_offset;
++		len -= hmem_iov_offset;
++		hmem_iov_offset = 0;
++
++		len = MIN(len, size);
++		if (!len)
++			continue;
++
++		/* this will initiate all iov copies under the same stream.
++		 * Which means completion will occur when all copies have
++		 * completed.
++		 */
++		if (dir == OFI_COPY_BUF_TO_IOV)
++			ret = ofi_async_copy_to_hmem(hmem_iface, device, hmem_buf,
++						(char *)buf + done, len, stream);
++		else
++			ret = ofi_async_copy_from_hmem(hmem_iface, device,
++						(char *)buf + done, hmem_buf,
++						len, stream);
++		if (ret)
++			return ret;
++
++		size -= len;
++		done += len;
++	}
++	return done;
++}
++
+ static ssize_t ofi_copy_hmem_iov_buf(enum fi_hmem_iface hmem_iface, uint64_t device,
+ 				     const struct iovec *hmem_iov,
+ 				     size_t hmem_iov_count,
+@@ -172,12 +265,11 @@ static ssize_t ofi_copy_hmem_iov_buf(enum fi_hmem_iface hmem_iface, uint64_t dev
+ 
+ 		if (dir == OFI_COPY_BUF_TO_IOV)
+ 			ret = ofi_copy_to_hmem(hmem_iface, device, hmem_buf,
+-					       (char *)buf + done, len);
++						(char *)buf + done, len);
+ 		else
+ 			ret = ofi_copy_from_hmem(hmem_iface, device,
+-						 (char *)buf + done, hmem_buf,
+-						 len);
+-
++						(char *)buf + done, hmem_buf,
++						len);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -187,6 +279,37 @@ static ssize_t ofi_copy_hmem_iov_buf(enum fi_hmem_iface hmem_iface, uint64_t dev
+ 	return done;
+ }
+ 
++int ofi_get_async_copy_cutoff(enum fi_hmem_iface iface, size_t *size)
++{
++	return hmem_ops[iface].get_async_copy_cutoff(size);
++}
++
++ssize_t ofi_async_copy_from_hmem_iov(void *dest, size_t size,
++			       enum fi_hmem_iface hmem_iface, uint64_t device,
++			       const struct iovec *hmem_iov,
++			       size_t hmem_iov_count,
++			       uint64_t hmem_iov_offset, void **stream)
++{
++	return ofi_async_copy_hmem_iov_buf(hmem_iface, device, hmem_iov,
++				hmem_iov_count, hmem_iov_offset,
++				dest, size, OFI_COPY_IOV_TO_BUF, stream);
++}
++
++ssize_t ofi_async_copy_to_hmem_iov(enum fi_hmem_iface hmem_iface, uint64_t device,
++			     const struct iovec *hmem_iov,
++			     size_t hmem_iov_count, uint64_t hmem_iov_offset,
++			     const void *src, size_t size, void **stream)
++{
++	return ofi_async_copy_hmem_iov_buf(hmem_iface, device, hmem_iov,
++				hmem_iov_count, hmem_iov_offset,
++				(void *) src, size, OFI_COPY_BUF_TO_IOV, stream);
++}
++
++int ofi_async_copy_query(enum fi_hmem_iface iface, void *stream)
++{
++	return hmem_ops[iface].async_copy_query(stream);
++}
++
+ ssize_t ofi_copy_from_hmem_iov(void *dest, size_t size,
+ 			       enum fi_hmem_iface hmem_iface, uint64_t device,
+ 			       const struct iovec *hmem_iov,
+@@ -208,15 +331,17 @@ ssize_t ofi_copy_to_hmem_iov(enum fi_hmem_iface hmem_iface, uint64_t device,
+ 				     (void *) src, size, OFI_COPY_BUF_TO_IOV);
+ }
+ 
+-int ofi_hmem_get_handle(enum fi_hmem_iface iface, void *base_addr, void **handle)
++int ofi_hmem_get_handle(enum fi_hmem_iface iface, void *base_addr,
++			size_t size, void **handle)
+ {
+-	return hmem_ops[iface].get_handle(base_addr, handle);
++	return hmem_ops[iface].get_handle(base_addr, size, handle);
+ }
+ 
+ int ofi_hmem_open_handle(enum fi_hmem_iface iface, void **handle,
+-			 uint64_t device, void **mapped_addr)
++			size_t size, uint64_t device, void **mapped_addr)
+ {
+-	return hmem_ops[iface].open_handle(handle, device, mapped_addr);
++	return hmem_ops[iface].open_handle(handle, size, device,
++					   mapped_addr);
+ }
+ 
+ int ofi_hmem_close_handle(enum fi_hmem_iface iface, void *mapped_addr)
+diff --git a/src/hmem_cuda.c b/src/hmem_cuda.c
+index cf39b1175..33d4b7743 100644
+--- a/src/hmem_cuda.c
++++ b/src/hmem_cuda.c
+@@ -293,7 +293,7 @@ int cuda_dev_unregister(uint64_t handle)
+ 	return FI_SUCCESS;
+ }
+ 
+-int cuda_get_handle(void *dev_buf, void **handle)
++int cuda_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	cudaError_t cuda_ret;
+ 
+@@ -309,7 +309,7 @@ int cuda_get_handle(void *dev_buf, void **handle)
+ 	return FI_SUCCESS;
+ }
+ 
+-int cuda_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int cuda_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	cudaError_t cuda_ret;
+ 
+@@ -807,12 +807,12 @@ int cuda_dev_unregister(uint64_t handle)
+ 	return FI_SUCCESS;
+ }
+ 
+-int cuda_get_handle(void *dev_buf, void **handle)
++int cuda_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+-int cuda_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int cuda_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	return -FI_ENOSYS;
+ }
+diff --git a/src/hmem_ipc_cache.c b/src/hmem_ipc_cache.c
+index 42fa7eca1..1efcb86bf 100644
+--- a/src/hmem_ipc_cache.c
++++ b/src/hmem_ipc_cache.c
+@@ -39,7 +39,8 @@ static int ipc_cache_add_region(struct ofi_mr_cache *cache, struct ofi_mr_entry
+ 	int ret;
+ 
+ 	ret = ofi_hmem_open_handle(entry->info.iface, (void **)&entry->info.ipc_handle,
+-				   entry->info.device, &entry->info.ipc_mapped_addr);
++				   entry->info.iov.iov_len, entry->info.device,
++				   &entry->info.ipc_mapped_addr);
+ 	if (ret == -FI_EALREADY) {
+ 		/*
+ 		 * There is a chance we can get the -FI_EALREADY from the
+@@ -59,7 +60,8 @@ static int ipc_cache_add_region(struct ofi_mr_cache *cache, struct ofi_mr_entry
+ 		 */
+ 		ofi_mr_cache_flush(cache, false);
+ 		ret = ofi_hmem_open_handle(entry->info.iface, (void **)&entry->info.ipc_handle,
+-						entry->info.device, &entry->info.ipc_mapped_addr);
++						entry->info.iov.iov_len, entry->info.device,
++						&entry->info.ipc_mapped_addr);
+ 	}
+ 	if (ret) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+@@ -90,11 +92,12 @@ int ofi_ipc_cache_open(struct ofi_mr_cache **cache,
+ 	struct ofi_mem_monitor *memory_monitors[OFI_HMEM_MAX] = {0};
+ 	int ret;
+ 
+-	/* no-op when cuda ipc is not enabled */
+-	if (!ofi_hmem_is_ipc_enabled(FI_HMEM_CUDA))
++	if (!ofi_hmem_is_ipc_enabled(FI_HMEM_CUDA) &&
++		!ofi_hmem_is_ipc_enabled(FI_HMEM_ROCR))
+ 		return FI_SUCCESS;
+ 
+ 	memory_monitors[FI_HMEM_CUDA] = cuda_ipc_monitor;
++	memory_monitors[FI_HMEM_ROCR] = rocr_ipc_monitor;
+ 
+ 	*cache = calloc(1, sizeof(*(*cache)));
+ 	if (!*cache) {
+diff --git a/src/hmem_rocr.c b/src/hmem_rocr.c
+index 31534e578..304f1dbd4 100644
+--- a/src/hmem_rocr.c
++++ b/src/hmem_rocr.c
+@@ -35,15 +35,42 @@
+ #endif
+ 
+ #include "ofi_hmem.h"
++#include "ofi_mem.h"
+ #include "ofi.h"
+ 
+ #if HAVE_ROCR
+ 
+-#include <hsa/hsa_ext_amd.h>
++#define HSA_MAX_SIGNALS 512
++#define HSA_MAX_STREAMS (HSA_MAX_SIGNALS / MAX_NUM_ASYNC_OP)
++#define DEVICE_THRESHOLD 524288
++#define H2D_THRESHOLD 1048576
+ 
+-struct rocr_ops {
++struct ofi_hsa_signal_info {
++	hsa_signal_t sig;
++	void *addr;
++};
++
++struct ofi_hsa_stream {
++	struct ofi_hsa_signal_info *sinfo[MAX_NUM_ASYNC_OP];
++	int num_signals;
++};
++
++OFI_DECLARE_FREESTACK(struct ofi_hsa_stream, rocm_ipc_stream_fs);
++OFI_DECLARE_FREESTACK(struct ofi_hsa_signal_info, rocm_ipc_signal_fs);
++
++pthread_spinlock_t fs_lock;
++struct rocm_ipc_stream_fs *ipc_stream_fs;
++struct rocm_ipc_signal_fs *ipc_signal_fs;
++
++struct hsa_ops {
+ 	hsa_status_t (*hsa_memory_copy)(void *dst, const void *src,
+ 					size_t size);
++	hsa_status_t (*hsa_amd_memory_async_copy)(void* dst, hsa_agent_t dst_agent,
++					const void* src,
++					hsa_agent_t src_agent, size_t size,
++					uint32_t num_dep_signals,
++					const hsa_signal_t* dep_signals,
++					hsa_signal_t completion_signal);
+ 	hsa_status_t (*hsa_amd_pointer_info)(void *ptr,
+ 					     hsa_amd_pointer_info_t *info,
+ 					     void *(*alloc)(size_t),
+@@ -65,50 +92,149 @@ struct rocr_ops {
+ 	hsa_status_t (*hsa_agent_get_info)(hsa_agent_t agent,
+ 					   hsa_agent_info_t attribute,
+ 					   void *value);
++	hsa_status_t (*hsa_amd_ipc_memory_create)(void* ptr, size_t len,
++					hsa_amd_ipc_memory_t* handle);
++	hsa_status_t (*hsa_amd_ipc_memory_attach)(
++		const hsa_amd_ipc_memory_t* handle, size_t len,
++		uint32_t num_agents,
++		const hsa_agent_t* mapping_agents,
++		void** mapped_ptr);
++	hsa_status_t (*hsa_amd_ipc_memory_detach)(void* mapped_ptr);
++	void (*hsa_signal_store_screlease)(hsa_signal_t signal,
++							hsa_signal_value_t value);
++	hsa_signal_value_t (*hsa_signal_load_scacquire)(hsa_signal_t signal);
++	hsa_status_t (*hsa_amd_agents_allow_access)(uint32_t num_agents,
++			const hsa_agent_t* agents,
++			const uint32_t* flags, const void* ptr);
++	hsa_status_t (*hsa_signal_create)(hsa_signal_value_t initial_value,
++			uint32_t num_consumers,
++			const hsa_agent_t *consumers,
++			hsa_signal_t *signal);
++	hsa_status_t (*hsa_signal_destroy)(hsa_signal_t signal);
+ };
+ 
+ #if ENABLE_ROCR_DLOPEN
+ 
+ #include <dlfcn.h>
+ 
+-static void *rocr_handle;
+-static struct rocr_ops rocr_ops;
++static void *hsa_handle;
++static struct hsa_ops hsa_ops;
+ 
+ #else
+ 
+-static struct rocr_ops rocr_ops = {
++static struct hsa_ops hsa_ops = {
++	/* mem copy ops */
+ 	.hsa_memory_copy = hsa_memory_copy,
++	/* Asynchronously copy a block of memory from the location pointed to by
++	 * src on the src_agent to the memory block pointed to by dst on the
++	 * dst_agent. */
++	.hsa_amd_memory_async_copy = hsa_amd_memory_async_copy,
++	/* gets information about the device mem pointer */
+ 	.hsa_amd_pointer_info = hsa_amd_pointer_info,
++	/* initialize the runt time library */
+ 	.hsa_init = hsa_init,
+ 	.hsa_shut_down = hsa_shut_down,
+ 	.hsa_status_string = hsa_status_string,
++	/* used for memory monitoring */
+ 	.hsa_amd_dereg_dealloc_cb =
+ 		hsa_amd_deregister_deallocation_callback,
+ 	.hsa_amd_reg_dealloc_cb =
+ 		hsa_amd_register_deallocation_callback,
++	/* memory lock/unlock used for registration */
+ 	.hsa_amd_memory_lock = hsa_amd_memory_lock,
+ 	.hsa_amd_memory_unlock = hsa_amd_memory_unlock,
+ 	.hsa_agent_get_info = hsa_agent_get_info,
++	/* Prepares an allocation for interprocess sharing and creates a
++	 * handle of type hsa_amd_ipc_memory_t uniquely identifying the
++	 * allocation. */
++	.hsa_amd_ipc_memory_create = hsa_amd_ipc_memory_create,
++	/* Imports shared memory into the local process and makes it accessible
++	 * by the given agents. */
++	.hsa_amd_ipc_memory_attach = hsa_amd_ipc_memory_attach,
++	/* Decrements the reference count for the shared memory mapping and
++	 * releases access to shared memory imported with
++	 * hsa_amd_ipc_memory_attach */
++	.hsa_amd_ipc_memory_detach = hsa_amd_ipc_memory_detach,
++	.hsa_signal_store_screlease = hsa_signal_store_screlease,
++	.hsa_signal_load_scacquire = hsa_signal_load_scacquire,
++	.hsa_amd_agents_allow_access = hsa_amd_agents_allow_access,
++	.hsa_signal_create = hsa_signal_create,
++	.hsa_signal_destroy = hsa_signal_destroy,
+ };
+ 
+ #endif /* ENABLE_ROCR_DLOPEN */
+ 
++static hsa_status_t
++ofi_hsa_amd_agents_allow_access(uint32_t num_agents, const hsa_agent_t* agents,
++				const uint32_t* flags, const void* ptr)
++{
++	return hsa_ops.hsa_amd_agents_allow_access(num_agents, agents, flags, ptr);
++}
++
++static void
++ofi_hsa_signal_store_screlease(hsa_signal_t signal, hsa_signal_value_t value)
++{
++	hsa_ops.hsa_signal_store_screlease(signal, value);
++}
++
++static hsa_signal_value_t ofi_hsa_signal_load_scacquire(hsa_signal_t signal)
++{
++	return hsa_ops.hsa_signal_load_scacquire(signal);
++}
++
++static void ofi_hsa_signal_create(struct ofi_hsa_signal_info *sinfo, void *arg)
++{
++	hsa_status_t hsa_ret;
++
++	if ((hsa_ret = hsa_ops.hsa_signal_create(1, 0, NULL,
++						&sinfo->sig) !=
++		HSA_STATUS_SUCCESS)) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to perform hsa_signal_create: %s\n",
++			ofi_hsa_status_to_string(hsa_ret));
++	}
++}
++
++static void ofi_hsa_signal_destroy(struct ofi_hsa_signal_info *sinfo, void *arg)
++{
++	hsa_status_t hsa_ret;
++
++	if ((hsa_ret = hsa_ops.hsa_signal_destroy(sinfo->sig) !=
++		HSA_STATUS_SUCCESS)) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to perform hsa_signal_destroy: %s\n",
++			ofi_hsa_status_to_string(hsa_ret));
++	}
++}
++
+ hsa_status_t ofi_hsa_amd_memory_lock(void *host_ptr, size_t size,
+ 				     hsa_agent_t *agents, int num_agents,
+ 				     void **agent_ptr)
+ {
+-	return rocr_ops.hsa_amd_memory_lock(host_ptr, size, agents, num_agents,
++	return hsa_ops.hsa_amd_memory_lock(host_ptr, size, agents, num_agents,
+ 					    agent_ptr);
+ }
+ 
+ hsa_status_t ofi_hsa_amd_memory_unlock(void *host_ptr)
+ {
+-	return rocr_ops.hsa_amd_memory_unlock(host_ptr);
++	return hsa_ops.hsa_amd_memory_unlock(host_ptr);
+ }
+ 
+ hsa_status_t ofi_hsa_memory_copy(void *dst, const void *src, size_t size)
+ {
+-	return rocr_ops.hsa_memory_copy(dst, src, size);
++	return hsa_ops.hsa_memory_copy(dst, src, size);
++}
++
++hsa_status_t ofi_hsa_amd_memory_async_copy(void* dst, hsa_agent_t dst_agent,
++					const void* src,
++					hsa_agent_t src_agent, size_t size,
++					uint32_t num_dep_signals,
++					const hsa_signal_t* dep_signals,
++					hsa_signal_t completion_signal)
++{
++	return hsa_ops.hsa_amd_memory_async_copy(dst, dst_agent,
++				src, src_agent, size, num_dep_signals,
++				dep_signals, completion_signal);
+ }
+ 
+ hsa_status_t ofi_hsa_amd_pointer_info(void *ptr, hsa_amd_pointer_info_t *info,
+@@ -116,24 +242,24 @@ hsa_status_t ofi_hsa_amd_pointer_info(void *ptr, hsa_amd_pointer_info_t *info,
+ 				      uint32_t *num_agents_accessible,
+ 				      hsa_agent_t **accessible)
+ {
+-	return rocr_ops.hsa_amd_pointer_info(ptr, info, alloc,
+-					     num_agents_accessible, accessible);
++	return hsa_ops.hsa_amd_pointer_info(ptr, info, alloc,
++		num_agents_accessible, accessible);
+ }
+ 
+ hsa_status_t ofi_hsa_init(void)
+ {
+-	return rocr_ops.hsa_init();
++	return hsa_ops.hsa_init();
+ }
+ 
+ hsa_status_t ofi_hsa_shut_down(void)
+ {
+-	return rocr_ops.hsa_shut_down();
++	return hsa_ops.hsa_shut_down();
+ }
+ 
+ hsa_status_t ofi_hsa_status_string(hsa_status_t status,
+ 				   const char **status_string)
+ {
+-	return rocr_ops.hsa_status_string(status, status_string);
++	return hsa_ops.hsa_status_string(status, status_string);
+ }
+ 
+ const char *ofi_hsa_status_to_string(hsa_status_t status)
+@@ -151,21 +277,21 @@ const char *ofi_hsa_status_to_string(hsa_status_t status)
+ hsa_status_t ofi_hsa_amd_dereg_dealloc_cb(void *ptr,
+ 					  hsa_amd_deallocation_callback_t cb)
+ {
+-	return rocr_ops.hsa_amd_dereg_dealloc_cb(ptr, cb);
++	return hsa_ops.hsa_amd_dereg_dealloc_cb(ptr, cb);
+ }
+ 
+ hsa_status_t ofi_hsa_amd_reg_dealloc_cb(void *ptr,
+ 					hsa_amd_deallocation_callback_t cb,
+ 					void *user_data)
+ {
+-	return rocr_ops.hsa_amd_reg_dealloc_cb(ptr, cb, user_data);
++	return hsa_ops.hsa_amd_reg_dealloc_cb(ptr, cb, user_data);
+ }
+ 
+ static hsa_status_t ofi_hsa_agent_get_info(hsa_agent_t agent,
+ 					   hsa_agent_info_t attribute,
+ 					   void *value)
+ {
+-	return rocr_ops.hsa_agent_get_info(agent, attribute, value);
++	return hsa_ops.hsa_agent_get_info(agent, attribute, value);
+ }
+ 
+ static int rocr_memcpy(void *dest, const void *src, size_t size)
+@@ -183,13 +309,18 @@ static int rocr_memcpy(void *dest, const void *src, size_t size)
+ 	return -FI_EIO;
+ }
+ 
+-static int rocr_host_memory_ptr(void *host_ptr, void **ptr)
++static int rocr_host_memory_ptr(void *host_ptr, void **ptr,
++				hsa_agent_t *agent, size_t *size,
++				uint64_t *offset, bool *system)
+ {
+ 	hsa_amd_pointer_info_t info = {
+ 		.size = sizeof(info),
+ 	};
+ 	hsa_status_t hsa_ret;
+ 
++	if (system)
++		*system = false;
++
+ 	hsa_ret = ofi_hsa_amd_pointer_info((void *)host_ptr, &info, NULL, NULL,
+ 					   NULL);
+ 	if (hsa_ret != HSA_STATUS_SUCCESS) {
+@@ -200,12 +331,30 @@ static int rocr_host_memory_ptr(void *host_ptr, void **ptr)
+ 		return -FI_EIO;
+ 	}
+ 
+-	if (info.type != HSA_EXT_POINTER_TYPE_LOCKED)
+-		*ptr = host_ptr;
+-	else
++	if (agent)
++		*agent = info.agentOwner;
++
++	if (size)
++		*size = info.sizeInBytes;
++
++	if (info.type != HSA_EXT_POINTER_TYPE_LOCKED) {
++		if (info.type == HSA_EXT_POINTER_TYPE_IPC ||
++			info.type == HSA_EXT_POINTER_TYPE_HSA)
++			*ptr = info.agentBaseAddress;
++		else
++			*ptr = host_ptr;
++
++		if (info.type == HSA_EXT_POINTER_TYPE_UNKNOWN && system)
++			*system = true;
++		if (offset)
++			*offset = host_ptr - *ptr;
++	} else {
+ 		*ptr = (void *) ((uintptr_t) info.agentBaseAddress +
+ 				 (uintptr_t) host_ptr -
+ 				 (uintptr_t) info.hostBaseAddress);
++		if (system)
++			*system = true;
++	}
+ 
+ 	return FI_SUCCESS;
+ }
+@@ -216,7 +365,9 @@ int rocr_copy_from_dev(uint64_t device, void *dest, const void *src,
+ 	int ret;
+ 	void *dest_memcpy_ptr;
+ 
+-	ret = rocr_host_memory_ptr(dest, &dest_memcpy_ptr);
++	ret = rocr_host_memory_ptr(dest, &dest_memcpy_ptr, NULL, NULL, NULL,
++							   NULL);
++
+ 	if (ret != FI_SUCCESS)
+ 		return ret;
+ 
+@@ -231,7 +382,8 @@ int rocr_copy_to_dev(uint64_t device, void *dest, const void *src,
+ 	int ret;
+ 	void *src_memcpy_ptr;
+ 
+-	ret = rocr_host_memory_ptr((void *) src, &src_memcpy_ptr);
++	ret = rocr_host_memory_ptr((void *) src, &src_memcpy_ptr, NULL, NULL,
++							   NULL, NULL);
+ 	if (ret != FI_SUCCESS)
+ 		return ret;
+ 
+@@ -240,6 +392,144 @@ int rocr_copy_to_dev(uint64_t device, void *dest, const void *src,
+ 	return ret;
+ }
+ 
++static int
++rocr_dev_async_copy(void *dst, const void *src, size_t size,
++		    void **stream)
++{
++	void *src_hsa_ptr;
++	void *dst_hsa_ptr;
++	int ret, i;
++	hsa_status_t hsa_ret;
++	struct ofi_hsa_stream *s;
++	struct ofi_hsa_signal_info *ipc_signal;
++	/* 0 - source agent
++	 * 1 - destination agent
++	 */
++	hsa_agent_t agents[2];
++	bool src_local, dst_local;
++
++	if (!stream)
++		return -FI_EINVAL;
++
++	ret = rocr_host_memory_ptr((void *)src, &src_hsa_ptr, &agents[0], NULL, NULL,
++				   &src_local);
++	if (ret != FI_SUCCESS)
++		return ret;
++
++	ret = rocr_host_memory_ptr(dst, &dst_hsa_ptr, &agents[1], NULL, NULL,
++				   &dst_local);
++	if (ret != FI_SUCCESS)
++		return ret;
++
++	pthread_spin_lock(&fs_lock);
++	if (!*stream) {
++		s = ofi_freestack_pop(ipc_stream_fs);
++		memset(s, 0, sizeof(*s));
++	} else {
++		s = *stream;
++	}
++
++	s->sinfo[s->num_signals]
++	  = ofi_freestack_pop(ipc_signal_fs);
++	ipc_signal = s->sinfo[s->num_signals];
++	pthread_spin_unlock(&fs_lock);
++
++	s->num_signals++;
++
++	/* device to device */
++	if (!src_local && !dst_local) {
++		hsa_ret = ofi_hsa_amd_agents_allow_access(2, agents, NULL, dst_hsa_ptr);
++		if (hsa_ret != HSA_STATUS_SUCCESS) {
++			FI_WARN(&core_prov, FI_LOG_CORE,
++					"Failed to perform hsa_amd_agents_allow_access %s\n",
++					ofi_hsa_status_to_string(hsa_ret));
++			ret = -FI_EINVAL;
++			goto fail;
++		}
++		ipc_signal->addr = NULL;
++	/* device to host */
++	} else if (!src_local && dst_local) {
++		hsa_ret = ofi_hsa_amd_memory_lock(dst, size, NULL, 0, &dst_hsa_ptr);
++		if (hsa_ret != HSA_STATUS_SUCCESS) {
++			ret = -FI_EINVAL;
++			goto fail;
++		}
++		ipc_signal->addr = dst;
++		agents[1] = agents[0];
++	}
++
++	ofi_hsa_signal_store_screlease(ipc_signal->sig, 1);
++
++	hsa_ret = ofi_hsa_amd_memory_async_copy(dst_hsa_ptr, agents[1],
++				src_hsa_ptr, agents[0],
++				size, 0, NULL, ipc_signal->sig);
++
++	if (hsa_ret != HSA_STATUS_SUCCESS) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++				"Failed to perform hsa_amd_memory_async_copy %s\n",
++				ofi_hsa_status_to_string(hsa_ret));
++		ret = -FI_EINVAL;
++		goto fail;
++	}
++
++finish:
++	*stream = s;
++
++	return 0;
++
++fail:
++	pthread_spin_lock(&fs_lock);
++	for (i = 0; i < s->num_signals; i++)
++		ofi_freestack_push(ipc_signal_fs, s->sinfo[i]);
++	ofi_freestack_push(ipc_stream_fs, s);
++	pthread_spin_unlock(&fs_lock);
++	return ret;
++}
++
++int rocr_async_copy_to_dev(uint64_t device, void *dst, const void *src,
++			   size_t size, void **stream)
++{
++	return rocr_dev_async_copy(dst, src, size, stream);
++}
++
++int rocr_async_copy_from_dev(uint64_t device, void *dst, const void *src,
++			     size_t size, void **stream)
++{
++	return rocr_dev_async_copy(dst, src, size, stream);
++}
++
++int rocr_async_copy_query(void *stream)
++{
++	struct ofi_hsa_stream *s = stream;
++	hsa_signal_value_t v;
++	int i;
++
++	for (i = 0; i < s->num_signals; i++) {
++		void *addr;
++
++		if (!s->sinfo[i])
++			continue;
++
++		v = ofi_hsa_signal_load_scacquire(s->sinfo[i]->sig);
++		if (v != 0)
++			return -FI_EBUSY;
++
++		addr = s->sinfo[i]->addr;
++		if (addr)
++			ofi_hsa_amd_memory_unlock(addr);
++
++		pthread_spin_lock(&fs_lock);
++		ofi_freestack_push(ipc_signal_fs, s->sinfo[i]);
++		pthread_spin_unlock(&fs_lock);
++		s->sinfo[i] = NULL;
++	}
++	pthread_spin_lock(&fs_lock);
++	ofi_freestack_push(ipc_stream_fs, s);
++	pthread_spin_unlock(&fs_lock);
++
++	return FI_SUCCESS;
++}
++
+ bool rocr_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags)
+ {
+ 	hsa_amd_pointer_info_t hsa_info = {
+@@ -275,97 +565,219 @@ bool rocr_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags)
+ 	return false;
+ }
+ 
++int rocr_get_ipc_handle_size(size_t *size)
++{
++	*size = sizeof(hsa_amd_ipc_memory_t);
++	return FI_SUCCESS;
++}
++
++int rocr_get_async_copy_cutoff(size_t *size)
++{
++	size_t cpy_thresh = DEVICE_THRESHOLD;
++
++	fi_param_get_size_t(&core_prov, "rocr_device_threshold",
++			    &cpy_thresh);
++
++	*size = cpy_thresh;
++
++	return FI_SUCCESS;
++}
++
++int rocr_get_base_addr(const void *ptr, void **base, size_t *size)
++{
++	return rocr_host_memory_ptr((void*)ptr, base, NULL, size, NULL, NULL);
++}
++
++int rocr_get_handle(void *dev_buf, size_t size, void **handle)
++{
++	hsa_status_t hsa_ret;
++
++	hsa_ret = hsa_ops.hsa_amd_ipc_memory_create(dev_buf, size,
++				(hsa_amd_ipc_memory_t *)handle);
++
++	if (hsa_ret == HSA_STATUS_SUCCESS)
++		return FI_SUCCESS;
++
++	FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to perform hsa_amd_ipc_memory_create: %s\n",
++			ofi_hsa_status_to_string(hsa_ret));
++
++	return -FI_EINVAL;
++}
++
++int rocr_open_handle(void **handle, size_t len, uint64_t device, void **ipc_ptr)
++{
++	hsa_status_t hsa_ret;
++
++	hsa_ret = hsa_ops.hsa_amd_ipc_memory_attach((hsa_amd_ipc_memory_t *)handle,
++					len, 0, NULL, ipc_ptr);
++	if (hsa_ret == HSA_STATUS_SUCCESS)
++		return FI_SUCCESS;
++
++	FI_WARN(&core_prov, FI_LOG_CORE,
++		"Failed to perform hsa_amd_ipc_memory_attach: %s\n",
++		ofi_hsa_status_to_string(hsa_ret));
++
++	return -FI_EINVAL;
++}
++
++int rocr_close_handle(void *ipc_ptr)
++{
++	hsa_status_t hsa_ret;
++
++	hsa_ret = hsa_ops.hsa_amd_ipc_memory_detach(ipc_ptr);
++
++	if (hsa_ret == HSA_STATUS_SUCCESS)
++		return FI_SUCCESS;
++
++	FI_WARN(&core_prov, FI_LOG_CORE,
++		"Failed to perform hsa_amd_ipc_memory_detach: %s\n",
++		ofi_hsa_status_to_string(hsa_ret));
++
++	return -FI_EINVAL;
++}
++
++bool rocr_is_ipc_enabled(void)
++{
++	return !ofi_hmem_p2p_disabled();
++}
++
+ static int rocr_hmem_dl_init(void)
+ {
+ #if ENABLE_ROCR_DLOPEN
+ 	/* Assume if dlopen fails, the ROCR library could not be found. Do not
+ 	 * treat this as an error.
+ 	 */
+-	rocr_handle = dlopen("libhsa-runtime64.so", RTLD_NOW);
+-	if (!rocr_handle) {
++	hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW);
++	if (!hsa_handle) {
+ 		FI_INFO(&core_prov, FI_LOG_CORE,
+ 			"Unable to dlopen libhsa-runtime64.so\n");
+ 		return -FI_ENOSYS;
+ 	}
+ 
+-	rocr_ops.hsa_memory_copy = dlsym(rocr_handle, "hsa_memory_copy");
+-	if (!rocr_ops.hsa_memory_copy) {
++	hsa_ops.hsa_memory_copy = dlsym(hsa_handle, "hsa_memory_copy");
++	if (!hsa_ops.hsa_memory_copy) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_memory_copy\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_amd_pointer_info = dlsym(rocr_handle,
++	hsa_ops.hsa_amd_memory_async_copy = dlsym(hsa_handle, "hsa_amd_memory_async_copy");
++	if (!hsa_ops.hsa_amd_memory_async_copy) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_amd_memory_async_copy\n");
++		goto err;
++	}
++
++	hsa_ops.hsa_amd_pointer_info = dlsym(hsa_handle,
+ 					      "hsa_amd_pointer_info");
+-	if (!rocr_ops.hsa_amd_pointer_info) {
++	if (!hsa_ops.hsa_amd_pointer_info) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_amd_pointer_info\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_init = dlsym(rocr_handle, "hsa_init");
+-	if (!rocr_ops.hsa_init) {
++	hsa_ops.hsa_init = dlsym(hsa_handle, "hsa_init");
++	if (!hsa_ops.hsa_init) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE, "Failed to find hsa_init\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_shut_down = dlsym(rocr_handle, "hsa_shut_down");
+-	if (!rocr_ops.hsa_shut_down) {
++	hsa_ops.hsa_shut_down = dlsym(hsa_handle, "hsa_shut_down");
++	if (!hsa_ops.hsa_shut_down) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_shut_down\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_status_string = dlsym(rocr_handle, "hsa_status_string");
+-	if (!rocr_ops.hsa_status_string) {
++	hsa_ops.hsa_status_string = dlsym(hsa_handle, "hsa_status_string");
++	if (!hsa_ops.hsa_status_string) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_status_string\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_amd_dereg_dealloc_cb =
+-		dlsym(rocr_handle, "hsa_amd_deregister_deallocation_callback");
+-	if (!rocr_ops.hsa_amd_dereg_dealloc_cb) {
++	hsa_ops.hsa_amd_dereg_dealloc_cb =
++		dlsym(hsa_handle, "hsa_amd_deregister_deallocation_callback");
++	if (!hsa_ops.hsa_amd_dereg_dealloc_cb) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_amd_deregister_deallocation_callback\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_amd_reg_dealloc_cb =
+-		dlsym(rocr_handle, "hsa_amd_register_deallocation_callback");
+-	if (!rocr_ops.hsa_amd_reg_dealloc_cb) {
++	hsa_ops.hsa_amd_reg_dealloc_cb =
++		dlsym(hsa_handle, "hsa_amd_register_deallocation_callback");
++	if (!hsa_ops.hsa_amd_reg_dealloc_cb) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_amd_register_deallocation_callback\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_amd_memory_lock = dlsym(rocr_handle,
++	hsa_ops.hsa_amd_memory_lock = dlsym(hsa_handle,
+ 					     "hsa_amd_memory_lock");
+-	if (!rocr_ops.hsa_amd_memory_lock) {
++	if (!hsa_ops.hsa_amd_memory_lock) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_amd_memory_lock\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_amd_memory_unlock = dlsym(rocr_handle,
++	hsa_ops.hsa_amd_memory_unlock = dlsym(hsa_handle,
+ 					       "hsa_amd_memory_unlock");
+-	if (!rocr_ops.hsa_amd_memory_lock) {
++	if (!hsa_ops.hsa_amd_memory_unlock) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_amd_memory_unlock\n");
+ 		goto err;
+ 	}
+ 
+-	rocr_ops.hsa_agent_get_info = dlsym(rocr_handle, "hsa_agent_get_info");
+-	if (!rocr_ops.hsa_agent_get_info) {
++	hsa_ops.hsa_agent_get_info = dlsym(hsa_handle, "hsa_agent_get_info");
++	if (!hsa_ops.hsa_agent_get_info) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+ 			"Failed to find hsa_agent_get_info\n");
+ 		goto err;
+ 	}
+ 
++	hsa_ops.hsa_amd_ipc_memory_create= dlsym(hsa_handle,
++					"hsa_amd_ipc_memory_create");
++	if (!hsa_ops.hsa_amd_ipc_memory_create) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_amd_ipc_memory_create\n");
++		goto err;
++	}
++
++	hsa_ops.hsa_amd_ipc_memory_attach = dlsym(hsa_handle,
++					"hsa_amd_ipc_memory_attach");
++	if (!hsa_ops.hsa_amd_ipc_memory_attach) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_amd_ipc_memory_attach\n");
++		goto err;
++	}
++
++	hsa_ops.hsa_amd_ipc_memory_detach = dlsym(hsa_handle,
++					"hsa_amd_ipc_memory_detach");
++	if (!hsa_ops.hsa_amd_ipc_memory_detach) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_amd_ipc_memory_detach\n");
++		goto err;
++	}
++
++	hsa_ops.hsa_signal_create = dlsym(hsa_handle, "hsa_signal_create");
++	if (!hsa_ops.hsa_signal_create) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_signal_create\n");
++		goto err;
++	}
++
++	hsa_ops.hsa_signal_destroy = dlsym(hsa_handle, "hsa_signal_destroy");
++	if (!hsa_ops.hsa_signal_destroy) {
++		FI_WARN(&core_prov, FI_LOG_CORE,
++			"Failed to find hsa_signal_destroy\n");
++		goto err;
++	}
++
+ 	return FI_SUCCESS;
+ 
+ err:
+-	dlclose(rocr_handle);
++	dlclose(hsa_handle);
+ 
+ 	return -FI_ENODATA;
+ #else
+@@ -376,7 +788,7 @@ err:
+ static void rocr_hmem_dl_cleanup(void)
+ {
+ #if ENABLE_ROCR_DLOPEN
+-	dlclose(rocr_handle);
++	dlclose(hsa_handle);
+ #endif
+ }
+ 
+@@ -386,14 +798,39 @@ int rocr_hmem_init(void)
+ 	int ret;
+ 	int log_level;
+ 
++	fi_param_define(NULL, "rocr_d2d_threshold", FI_PARAM_SIZE_T,
++			"Threshold for switching to hsa memcpy for device-to-host copies."
++			" (Default 16384");
++
++	fi_param_define(NULL, "rocr_device_threshold", FI_PARAM_SIZE_T,
++			"Threshold for switching to hsa memcpy for device-to-host copies."
++			" (Default 16384");
++
++	fi_param_define(NULL, "rocr_h2d_threshold", FI_PARAM_SIZE_T,
++			"Threshold for switching to hsa memcpy for host-to-device copies."
++			" (Default 1048576");
++
+ 	ret = rocr_hmem_dl_init();
+ 	if (ret != FI_SUCCESS)
+ 		return ret;
+ 
+ 	hsa_ret = ofi_hsa_init();
+-	if (hsa_ret == HSA_STATUS_SUCCESS)
+-		return FI_SUCCESS;
++	if (hsa_ret != HSA_STATUS_SUCCESS)
++		goto fail;
++
++	ipc_stream_fs = rocm_ipc_stream_fs_create(HSA_MAX_STREAMS,
++				NULL, NULL);
++	if (!ipc_stream_fs)
++		goto fail;
++
++	ipc_signal_fs = rocm_ipc_signal_fs_create(HSA_MAX_SIGNALS,
++				ofi_hsa_signal_create, NULL);
++	if (!ipc_signal_fs)
++		goto fail;
+ 
++	return 0;
++
++fail:
+ 	/* Treat HSA_STATUS_ERROR_OUT_OF_RESOURCES as ROCR not being supported
+ 	 * instead of an error. This ROCR error is typically returned if no
+ 	 * devices are supported.
+@@ -419,6 +856,11 @@ int rocr_hmem_cleanup(void)
+ {
+ 	hsa_status_t hsa_ret;
+ 
++	rocm_ipc_signal_fs_destroy(ipc_signal_fs, HSA_MAX_SIGNALS,
++				   ofi_hsa_signal_destroy, NULL);
++
++	rocm_ipc_stream_fs_free(ipc_stream_fs);
++
+ 	hsa_ret = ofi_hsa_shut_down();
+ 	if (hsa_ret != HSA_STATUS_SUCCESS) {
+ 		FI_WARN(&core_prov, FI_LOG_CORE,
+@@ -463,28 +905,6 @@ int rocr_host_unregister(void *ptr)
+ 	return -FI_EIO;
+ }
+ 
+-int rocr_get_base_addr(const void *ptr, void **base, size_t *size)
+-{
+-	hsa_amd_pointer_info_t hsa_info = {
+-		.size = sizeof(hsa_info),
+-	};
+-	hsa_status_t hsa_ret;
+-
+-	hsa_ret = ofi_hsa_amd_pointer_info((void *)ptr, &hsa_info, NULL, NULL,
+-					   NULL);
+-	if (hsa_ret != HSA_STATUS_SUCCESS) {
+-		FI_WARN(&core_prov, FI_LOG_CORE,
+-			"Failed to perform hsa_amd_pointer_info: %s\n",
+-			ofi_hsa_status_to_string(hsa_ret));
+-		return -FI_EIO;
+-	}
+-
+-	*base = hsa_info.agentBaseAddress;
+-	*size = hsa_info.sizeInBytes;
+-
+-	return FI_SUCCESS;
+-}
+-
+ #else
+ 
+ int rocr_copy_from_dev(uint64_t device, void *dest, const void *src,
+@@ -524,9 +944,56 @@ int rocr_host_unregister(void *ptr)
+ 	return -FI_ENOSYS;
+ }
+ 
++int rocr_get_handle(void *dev_buf, size_t size, void **handle)
++{
++	return -FI_ENOSYS;
++}
++
++int rocr_open_handle(void **handle, size_t len, uint64_t device, void **ipc_ptr)
++{
++	return -FI_ENOSYS;
++}
++
++int rocr_close_handle(void *ipc_ptr)
++{
++	return -FI_ENOSYS;
++}
++
++bool rocr_is_ipc_enabled(void)
++{
++	return false;
++}
++
++int rocr_get_ipc_handle_size(size_t *size)
++{
++	return -FI_ENOSYS;
++}
++
+ int rocr_get_base_addr(const void *ptr, void **base, size_t *size)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
++int rocr_async_copy_to_dev(uint64_t device, void *dst, const void *src,
++			   size_t size, void *istream, void **ostream)
++{
++	return -FI_ENOSYS;
++}
++
++int rocr_async_copy_from_dev(uint64_t device, void *dst, const void *src,
++			     size_t size, void *istream, void **ostream)
++{
++	return -FI_ENOSYS;
++}
++
++int rocr_async_copy_query(void *stream)
++{
++	return -FI_ENOSYS;
++}
++
++int rocr_get_async_copy_cutoff(size_t *size)
++{
++	return -FI_ENOSYS;
++}
++
+ #endif /* HAVE_ROCR */
+diff --git a/src/hmem_synapseai.c b/src/hmem_synapseai.c
+index 30dd5d6e8..ad5a87690 100644
+--- a/src/hmem_synapseai.c
++++ b/src/hmem_synapseai.c
+@@ -105,12 +105,12 @@ bool synapseai_is_addr_valid(const void *addr, uint64_t *device,
+ 	return false;
+ }
+ 
+-int synapseai_get_handle(void *dev_buf, void **handle)
++int synapseai_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+-int synapseai_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int synapseai_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	return -FI_ENOSYS;
+ }
+@@ -189,12 +189,12 @@ bool synapseai_is_addr_valid(const void *addr, uint64_t *device,
+ 	return false;
+ }
+ 
+-int synapseai_get_handle(void *dev_buf, void **handle)
++int synapseai_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+-int synapseai_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int synapseai_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	return -FI_ENOSYS;
+ }
+@@ -228,4 +228,4 @@ int synapseai_get_dmabuf_fd(uint64_t addr, uint64_t size, int* fd)
+ {
+ 	return -FI_ENOSYS;
+ }
+-#endif /* HAVE_SYNAPSEAI */
+\ No newline at end of file
++#endif /* HAVE_SYNAPSEAI */
+diff --git a/src/hmem_ze.c b/src/hmem_ze.c
+index 90a650939..ff67f321b 100644
+--- a/src/hmem_ze.c
++++ b/src/hmem_ze.c
+@@ -396,7 +396,7 @@ int ze_hmem_get_shared_handle(int dev_fd, void *dev_buf, int *ze_fd,
+ 	int ret;
+ 
+ 	assert(dev_fd != -1);
+-	ret = ze_hmem_get_handle(dev_buf, (void **) &ze_handle);
++	ret = ze_hmem_get_handle(dev_buf, 0, (void **) &ze_handle);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -433,7 +433,7 @@ int ze_hmem_open_shared_handle(int dev_fd, void **handle, int *ze_fd,
+ 	*ze_fd = open_fd.fd;
+ 	memset(&ze_handle, 0, sizeof(ze_handle));
+ 	memcpy(&ze_handle, &open_fd.fd, sizeof(open_fd.fd));
+-	return ze_hmem_open_handle((void **) &ze_handle, device, ipc_ptr);
++	return ze_hmem_open_handle((void **) &ze_handle, 0, device, ipc_ptr);
+ }
+ 
+ bool ze_hmem_p2p_enabled(void)
+@@ -909,7 +909,7 @@ bool ze_hmem_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags)
+ 	return true;
+ }
+ 
+-int ze_hmem_get_handle(void *dev_buf, void **handle)
++int ze_hmem_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	ze_result_t ze_ret;
+ 
+@@ -923,7 +923,7 @@ int ze_hmem_get_handle(void *dev_buf, void **handle)
+ 	return FI_SUCCESS;
+ }
+ 
+-int ze_hmem_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int ze_hmem_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	ze_result_t ze_ret;
+ 	int dev_id = (int) device;
+@@ -1052,12 +1052,12 @@ bool ze_hmem_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags)
+ 	return false;
+ }
+ 
+-int ze_hmem_get_handle(void *dev_buf, void **handle)
++int ze_hmem_get_handle(void *dev_buf, size_t size, void **handle)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+-int ze_hmem_open_handle(void **handle, uint64_t device, void **ipc_ptr)
++int ze_hmem_open_handle(void **handle, size_t size, uint64_t device, void **ipc_ptr)
+ {
+ 	return -FI_ENOSYS;
+ }
+
