@@ -1,0 +1,21 @@
+diff --git a/src/hmem_rocr.c b/src/hmem_rocr.c
+index 8e1c0d55d..304f1dbd4 100644
+--- a/src/hmem_rocr.c
++++ b/src/hmem_rocr.c
+@@ -975,13 +975,13 @@ int rocr_get_base_addr(const void *ptr, void **base, size_t *size)
+ }
+ 
+ int rocr_async_copy_to_dev(uint64_t device, void *dst, const void *src,
+-			   size_t size, void **ostream)
++			   size_t size, void *istream, void **ostream)
+ {
+ 	return -FI_ENOSYS;
+ }
+ 
+ int rocr_async_copy_from_dev(uint64_t device, void *dst, const void *src,
+-			     size_t size, void **stream)
++			     size_t size, void *istream, void **ostream)
+ {
+ 	return -FI_ENOSYS;
+ }
+
