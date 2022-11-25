@@ -1,0 +1,56 @@
+diff --git a/src/hmem_rocr.c b/src/hmem_rocr.c
+index 8e1c0d55d..fd7283a05 100644
+--- a/src/hmem_rocr.c
++++ b/src/hmem_rocr.c
+@@ -421,18 +421,22 @@ rocr_dev_async_copy(void *dst, const void *src, size_t size,
+ 	if (ret != FI_SUCCESS)
+ 		return ret;
+ 
+-	pthread_spin_lock(&fs_lock);
+ 	if (!*stream) {
++		pthread_spin_lock(&fs_lock);
+ 		s = ofi_freestack_pop(ipc_stream_fs);
++		pthread_spin_unlock(&fs_lock);
++		if (!s)
++			return -FI_ENOMEM;
+ 		memset(s, 0, sizeof(*s));
+ 	} else {
+ 		s = *stream;
+ 	}
+ 
++	pthread_spin_lock(&fs_lock);
+ 	s->sinfo[s->num_signals]
+ 	  = ofi_freestack_pop(ipc_signal_fs);
+-	ipc_signal = s->sinfo[s->num_signals];
+ 	pthread_spin_unlock(&fs_lock);
++	ipc_signal = s->sinfo[s->num_signals];
+ 
+ 	s->num_signals++;
+ 
+@@ -472,7 +476,6 @@ rocr_dev_async_copy(void *dst, const void *src, size_t size,
+ 		goto fail;
+ 	}
+ 
+-finish:
+ 	*stream = s;
+ 
+ 	return 0;
+@@ -828,6 +831,8 @@ int rocr_hmem_init(void)
+ 	if (!ipc_signal_fs)
+ 		goto fail;
+ 
++	ofi_spin_init(&fs_lock);
++
+ 	return 0;
+ 
+ fail:
+@@ -975,7 +980,7 @@ int rocr_get_base_addr(const void *ptr, void **base, size_t *size)
+ }
+ 
+ int rocr_async_copy_to_dev(uint64_t device, void *dst, const void *src,
+-			   size_t size, void **ostream)
++			   size_t size, void **stream)
+ {
+ 	return -FI_ENOSYS;
+ }
+
